@@ -169,7 +169,11 @@ impl RecordBatchEncoder {
             );
 
             if ipc_batch_tx
-                .send(IpcBatch::Record(array_combine_handle, permit))
+                .send(IpcBatch::Record {
+                    encoded_data: array_combine_handle,
+                    morsel_permit: permit,
+                    num_rows: height as u64,
+                })
                 .await
                 .is_err()
             {

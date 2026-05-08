@@ -7,7 +7,8 @@ use arrow::io::ipc::write::{EncodedDataBytes, arrow_ipc_block};
 use bytes::Bytes;
 use polars_core::schema::SchemaRef;
 use polars_core::utils::arrow;
-use polars_error::PolarsResult;
+use polars_error::{PolarsResult, to_compute_err};
+use polars_io::ipc::pl_ipc_metadata::{POLARS_IPC_METADATA_KEY, PlIpcMetadata};
 use polars_io::ipc::{IpcWriter, IpcWriterOptions};
 use polars_io::utils::file::Writeable;
 use polars_io::{SerWriter, schema_to_arrow_checked};
@@ -21,6 +22,7 @@ pub struct IOWriter {
     pub options: Arc<IpcWriterOptions>,
     pub schema: SchemaRef,
     pub ipc_fields: Vec<IpcField>,
+    pub write_custom_pl_metadata: bool,
 }
 
 impl IOWriter {
@@ -31,9 +33,12 @@ impl IOWriter {
             options,
             schema,
             ipc_fields,
+            write_custom_pl_metadata,
         } = self;
 
         let (file, sync_on_close) = file.await?;
+
+        let mut custom_pl_metadata = write_custom_pl_metadata.then_some(PlIpcMetadata::default());
 
         match file {
             Writeable::Cloud(cloudwriter) => {
@@ -67,8 +72,12 @@ impl IOWriter {
                 // Process each incoming batch as a message.
                 while let Some(batch) = ipc_batch_rx.recv().await {
                     match batch {
-                        IpcBatch::Record(handle, sink_morsel_permit) => {
-                            let encoded_data = handle.await;
+                        IpcBatch::Record {
+                            encoded_data,
+                            morsel_permit,
+                            num_rows,
+                        } => {
+                            let encoded_data = encoded_data.await;
                             let encoded_data = EncodedDataBytes {
                                 ipc_message: Bytes::from(encoded_data.ipc_message),
                                 arrow_data: Bytes::from(encoded_data.arrow_data),
@@ -83,7 +92,11 @@ impl IOWriter {
                             record_blocks.push(block);
                             block_offsets += meta + data;
 
-                            drop(sink_morsel_permit);
+                            if let Some(custom_pl_metadata) = custom_pl_metadata.as_mut() {
+                                custom_pl_metadata.record_batch_num_rows.push(num_rows);
+                            }
+
+                            drop(morsel_permit);
                         },
                         IpcBatch::Dictionary(dictionary_data) => {
                             let encoded_dictionary = EncodedDataBytes {
@@ -110,6 +123,14 @@ impl IOWriter {
                     &ipc_fields,
                     dictionary_blocks,
                     record_blocks,
+                    if let Some(custom_pl_metadata) = custom_pl_metadata {
+                        Some(vec![(
+                            POLARS_IPC_METADATA_KEY.into(),
+                            serde_json::to_string(&custom_pl_metadata).map_err(to_compute_err)?,
+                        )])
+                    } else {
+                        None
+                    },
                     None,
                 );
                 push_magic(&mut sink_queue, false);
@@ -131,16 +152,32 @@ impl IOWriter {
 
                 while let Some(batch) = ipc_batch_rx.recv().await {
                     match batch {
-                        IpcBatch::Record(handle, sink_morsel_permit) => {
-                            let encoded_data = handle.await;
+                        IpcBatch::Record {
+                            encoded_data,
+                            morsel_permit,
+                            num_rows,
+                        } => {
+                            let encoded_data = encoded_data.await;
                             ipc_writer.write_encoded(&[], &encoded_data)?;
+
+                            if let Some(custom_pl_metadata) = custom_pl_metadata.as_mut() {
+                                custom_pl_metadata.record_batch_num_rows.push(num_rows);
+                            }
+
                             drop(encoded_data);
-                            drop(sink_morsel_permit);
+                            drop(morsel_permit);
                         },
                         IpcBatch::Dictionary(dictionary_data) => {
                             ipc_writer.write_encoded_dictionaries(&[dictionary_data])?
                         },
                     }
+                }
+
+                if let Some(custom_pl_metadata) = custom_pl_metadata {
+                    ipc_writer.set_custom_metadata(vec![(
+                        POLARS_IPC_METADATA_KEY.into(),
+                        serde_json::to_string(&custom_pl_metadata).map_err(to_compute_err)?,
+                    )]);
                 }
 
                 ipc_writer.finish()?;
